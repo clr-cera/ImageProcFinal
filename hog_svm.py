@@ -229,7 +229,9 @@ def score_at(per_image, threshold):
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    return tp, fp, fn, precision, recall, f1
+    # No true negatives exist in detection, so accuracy is TP / (TP + FP + FN).
+    accuracy = tp / (tp + fp + fn) if tp + fp + fn else 0.0
+    return tp, fp, fn, precision, recall, f1, accuracy
 
 
 def evaluate(clf, test):
@@ -241,10 +243,11 @@ def evaluate(clf, test):
         per_image.append((boxes, dets))
         save_vis(img_path, boxes, [(s, b) for s, b in nms(dets) if s >= VIS_THRESHOLD])
 
-    lines = [f"{'thresh':>7} {'TP':>4} {'FP':>4} {'FN':>4} {'prec':>6} {'recall':>7} {'F1':>6}"]
+    header = f"{'thresh':>7} {'TP':>4} {'FP':>4} {'FN':>4} {'prec':>6} {'recall':>7} {'F1':>6} {'acc':>6}"
+    lines = [header]
     for t in THRESHOLDS:
-        tp, fp, fn, p, r, f1 = score_at(per_image, t)
-        lines.append(f"{t:>7.2f} {tp:>4} {fp:>4} {fn:>4} {p:>6.2f} {r:>7.2f} {f1:>6.2f}")
+        tp, fp, fn, p, r, f1, acc = score_at(per_image, t)
+        lines.append(f"{t:>7.2f} {tp:>4} {fp:>4} {fn:>4} {p:>6.2f} {r:>7.2f} {f1:>6.2f} {acc:>6.2f}")
     table = "\n".join(lines)
     print(table)
     (OUT_DIR / "metrics.txt").write_text(table + "\n")
