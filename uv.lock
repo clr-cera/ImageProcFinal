@@ -433,6 +433,7 @@ dependencies = [
     { name = "roboflow" },
     { name = "scikit-image" },
     { name = "scikit-learn" },
+    { name = "tqdm" },
     { name = "ultralytics" },
 ]
 
@@ -445,6 +446,7 @@ requires-dist = [
     { name = "roboflow", specifier = ">=1.3.10" },
     { name = "scikit-image", specifier = ">=0.26.0" },
     { name = "scikit-learn", specifier = ">=1.9.0" },
+    { name = "tqdm", specifier = ">=4.68.3" },
     { name = "ultralytics", specifier = ">=8.4.71" },
 ]
 

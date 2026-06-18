@@ -6,8 +6,9 @@ Pipeline:
   3. Describe each window with a HOG feature vector and train a linear SVM.
   4. One round of hard-negative mining to suppress false positives.
   5. Detect via an image pyramid + sliding window + non-maximum suppression.
-  6. Report precision/recall/F1 on a held-out split and save annotated images
-     to detections/ (green = ground truth, red = detection).
+  6. Repeat steps 2-5 in 5-fold cross-validation (every image tested once), pool
+     the detections, and report precision/recall/F1/accuracy. Annotated images
+     are saved to detections/ (green = ground truth, red = detection).
 """
 
 import random
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
+from tqdm import tqdm
 from skimage import color, io
 from skimage.feature import hog
 from skimage.transform import resize
@@ -45,7 +47,8 @@ MATCH_IOU = 0.5  # overlap required to count a detection as correct
 SWEEP_MIN = -1.0  # collect all windows scoring above this, then sweep cutoffs
 THRESHOLDS = [-0.5, 0.0, 0.25, 0.5, 0.75, 1.0]  # operating points to report
 VIS_THRESHOLD = 0.0  # cutoff used for the saved annotated images
-SEED = 0
+N_FOLDS = 5  # cross-validation folds (every image is tested exactly once)
+SEED = 42
 
 RNG = np.random.default_rng(SEED)
 
@@ -105,7 +108,7 @@ def window_feature(patch):
 
 def positives(samples):
     feats = []
-    for _, gray, boxes in samples:
+    for _, gray, boxes in tqdm(samples, desc="positives"):
         for box in boxes:
             x1, y1, x2, y2 = (int(round(v)) for v in box)
             if x2 - x1 < 8 or y2 - y1 < 8:
@@ -118,7 +121,7 @@ def positives(samples):
 
 def negatives(samples, n_per_image=NEG_PER_IMAGE):
     feats = []
-    for _, gray, boxes in samples:
+    for _, gray, boxes in tqdm(samples, desc="negatives"):
         h, w = gray.shape
         count = attempts = 0
         while count < n_per_image and attempts < n_per_image * 20:
@@ -186,7 +189,7 @@ def nms(dets, iou_thr=NMS_IOU):
 def hard_negatives(clf, samples):
     """High-scoring windows that do not overlap any cup become extra negatives."""
     feats = []
-    for _, gray, boxes in samples:
+    for _, gray, boxes in tqdm(samples, desc="hard negatives"):
         h, w = gray.shape
         for _, box in detect(clf, gray, threshold=0.0):
             if all(iou(box, b) < 0.3 for b in boxes):
@@ -234,15 +237,20 @@ def score_at(per_image, threshold):
     return tp, fp, fn, precision, recall, f1, accuracy
 
 
-def evaluate(clf, test):
-    OUT_DIR.mkdir(exist_ok=True)
-    # Collect raw detections once (expensive), then sweep cutoffs cheaply.
-    per_image = []
-    for img_path, gray, boxes in test:
-        dets = detect(clf, gray, threshold=SWEEP_MIN)
-        per_image.append((boxes, dets))
-        save_vis(img_path, boxes, [(s, b) for s, b in nms(dets) if s >= VIS_THRESHOLD])
+def train_classifier(train):
+    """Run the full training recipe (HOG SVM + one round of hard-negative mining)."""
+    pos = positives(train)
+    neg = negatives(train)
+    clf = train_svm(pos, neg)
+    hard = hard_negatives(clf, train)
+    tqdm.write(f"  {len(pos)} pos, {len(neg)} neg, {len(hard)} hard negatives")
+    if hard:
+        clf = train_svm(pos, neg + hard)
+    return clf
 
+
+def report(per_image):
+    """Sweep score cutoffs over the pooled cross-validation detections."""
     header = f"{'thresh':>7} {'TP':>4} {'FP':>4} {'FN':>4} {'prec':>6} {'recall':>7} {'F1':>6} {'acc':>6}"
     lines = [header]
     for t in THRESHOLDS:
@@ -251,30 +259,32 @@ def evaluate(clf, test):
     table = "\n".join(lines)
     print(table)
     (OUT_DIR / "metrics.txt").write_text(table + "\n")
-    print(f"metrics table saved to {OUT_DIR / 'metrics.txt'}")
 
 
 def main():
     samples = load_dataset()
+    OUT_DIR.mkdir(exist_ok=True)
     idx = list(range(len(samples)))
     random.Random(SEED).shuffle(idx)
-    n_test = max(1, len(samples) // 5)
-    test = [samples[i] for i in idx[:n_test]]
-    train = [samples[i] for i in idx[n_test:]]
-    print(f"{len(train)} train / {len(test)} test images")
+    folds = [idx[k::N_FOLDS] for k in range(N_FOLDS)]  # each image in one fold
 
-    pos = positives(train)
-    neg = negatives(train)
-    print(f"{len(pos)} positives, {len(neg)} negatives")
-    clf = train_svm(pos, neg)
+    # Cross-validation: train on the other folds, test on this fold, and pool
+    # every image's detections so the final metrics use the whole dataset once.
+    per_image = []
+    for k, fold in enumerate(folds):
+        test_ids = set(fold)
+        test = [samples[i] for i in fold]
+        train = [samples[i] for i in idx if i not in test_ids]
+        print(f"fold {k + 1}/{N_FOLDS}: {len(train)} train / {len(test)} test images")
+        clf = train_classifier(train)
+        for img_path, gray, boxes in tqdm(test, desc=f"fold {k + 1} detecting"):
+            dets = detect(clf, gray, threshold=SWEEP_MIN)
+            per_image.append((boxes, dets))
+            save_vis(img_path, boxes, [(s, b) for s, b in nms(dets) if s >= VIS_THRESHOLD])
 
-    hard = hard_negatives(clf, train)
-    print(f"{len(hard)} hard negatives mined")
-    if hard:
-        clf = train_svm(pos, neg + hard)
-
-    evaluate(clf, test)
-    print(f"annotated detections saved to {OUT_DIR}/")
+    report(per_image)
+    print(f"{N_FOLDS}-fold CV over {len(per_image)} images; "
+          f"metrics saved to {OUT_DIR / 'metrics.txt'}, annotated images in {OUT_DIR}/")
 
 
 if __name__ == "__main__":

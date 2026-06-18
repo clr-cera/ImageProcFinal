@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
+from tqdm import tqdm
 from skimage import color, io
 from skimage.feature import canny
 from skimage.transform import hough_ellipse, resize
@@ -48,11 +49,13 @@ HOUGH_THRESHOLD = 6  # min accumulator votes for an ellipse to be kept
 HOUGH_ACCURACY = 12  # bin size for the minor-axis accumulator (speed/precision)
 MIN_FLATNESS = 0.15  # reject near-degenerate (line-like) ellipses: b/a >= this
 CUP_ASPECT = 1.3  # cup-body height as a multiple of rim width (downward growth)
+MAX_HOUGH_NEG = 2000  # cap on mined hough hard negatives (the rest are redundant)
 NMS_IOU = 0.3  # overlap above which cup boxes are merged
 MATCH_IOU = 0.5  # overlap required to count a detection as correct
 THRESHOLDS = [-0.5, 0.0, 0.25, 0.5, 0.75, 1.0]  # SVM operating points to report
 VIS_THRESHOLD = 0.0  # SVM cutoff used for the saved annotated images
-SEED = 0
+N_FOLDS = 5  # cross-validation folds (every image is tested exactly once)
+SEED = 42
 
 
 def load_gray(path):
@@ -168,6 +171,29 @@ def classify(clf, gray, proposals):
     return [(float(s), cup, rim) for s, (cup, rim) in zip(scores, kept)]
 
 
+def hough_hard_negatives(clf, samples, threshold=0.0):
+    """Ellipse proposals the SVM accepts but that overlap no real cup.
+
+    These are exactly the false rim-edges (plates, shadows, arcs) the classifier
+    currently mistakes for cups, so they make especially informative negatives.
+    """
+    feats = []
+    for _, gray, boxes in tqdm(samples, desc="hough hard negatives"):
+        h, w = gray.shape
+        for s, cup, _ in classify(clf, gray, ellipse_proposals(gray)):
+            if s < threshold:
+                continue
+            if all(iou(cup, b) < 0.3 for b in boxes):
+                x1, y1, x2, y2 = (int(round(v)) for v in clip_box(cup, w, h))
+                if x2 - x1 >= 8 and y2 - y1 >= 8:
+                    feats.append(window_feature(gray[y1:y2, x1:x2]))
+    # These proposals are highly redundant; a random cap keeps the SVM balanced
+    # and lets liblinear converge quickly instead of grinding to max_iter.
+    if len(feats) > MAX_HOUGH_NEG:
+        feats = random.Random(SEED).sample(feats, MAX_HOUGH_NEG)
+    return feats
+
+
 def nms(dets, iou_thr=NMS_IOU):
     keep = []
     for det in sorted(dets, key=lambda d: d[0], reverse=True):
@@ -214,17 +240,23 @@ def score_at(per_image, threshold):
     return tp, fp, fn, precision, recall, f1, accuracy
 
 
-def evaluate(clf, test):
-    OUT_DIR.mkdir(exist_ok=True)
-    # Score all proposals once, then sweep SVM cutoffs cheaply.
-    per_image = []
-    for img_path, gray, boxes in test:
-        dets = classify(clf, gray, ellipse_proposals(gray))
-        per_image.append((boxes, dets))
-        vis = nms([d for d in dets if d[0] >= VIS_THRESHOLD])
-        save_vis(img_path, boxes, vis)
-        print(f"  {img_path.name}: {len(dets)} proposals, {len(vis)} accepted")
+def train_classifier(train):
+    """Run the full training recipe (HOG SVM + both hard-negative sources)."""
+    pos = positives(train)
+    neg = negatives(train)
+    clf = train_svm(pos, neg)
+    hard = hard_negatives(clf, train)  # sliding-window false positives
+    hough_hard = hough_hard_negatives(clf, train)  # false rim-edge proposals
+    tqdm.write(f"  {len(pos)} pos, {len(neg)} neg, "
+               f"{len(hard)} sliding-window + {len(hough_hard)} hough hard negatives")
+    extra = hard + hough_hard
+    if extra:
+        clf = train_svm(pos, neg + extra)
+    return clf
 
+
+def report(per_image):
+    """Sweep SVM cutoffs over the pooled cross-validation detections."""
     header = f"{'thresh':>7} {'TP':>4} {'FP':>4} {'FN':>4} {'prec':>6} {'recall':>7} {'F1':>6} {'acc':>6}"
     lines = [header]
     for t in THRESHOLDS:
@@ -233,29 +265,32 @@ def evaluate(clf, test):
     table = "\n".join(lines)
     print(table)
     (OUT_DIR / "metrics.txt").write_text(table + "\n")
-    print(f"metrics table saved to {OUT_DIR / 'metrics.txt'}")
-    print(f"annotated detections saved to {OUT_DIR}/")
 
 
 def main():
     samples = load_dataset()
+    OUT_DIR.mkdir(exist_ok=True)
     idx = list(range(len(samples)))
     random.Random(SEED).shuffle(idx)
-    n_test = max(1, len(samples) // 5)
-    test = [samples[i] for i in idx[:n_test]]
-    train = [samples[i] for i in idx[n_test:]]
-    print(f"{len(train)} train / {len(test)} test images (same split as hog_svm.py)")
+    folds = [idx[k::N_FOLDS] for k in range(N_FOLDS)]  # each image in one fold
 
-    pos = positives(train)
-    neg = negatives(train)
-    print(f"{len(pos)} positives, {len(neg)} negatives")
-    clf = train_svm(pos, neg)
-    hard = hard_negatives(clf, train)
-    print(f"{len(hard)} hard negatives mined")
-    if hard:
-        clf = train_svm(pos, neg + hard)
+    # Cross-validation: train on the other folds, test on this fold, and pool
+    # every image's detections so the final metrics use the whole dataset once.
+    per_image = []
+    for k, fold in enumerate(folds):
+        test_ids = set(fold)
+        test = [samples[i] for i in fold]
+        train = [samples[i] for i in idx if i not in test_ids]
+        print(f"fold {k + 1}/{N_FOLDS}: {len(train)} train / {len(test)} test images")
+        clf = train_classifier(train)
+        for img_path, gray, boxes in tqdm(test, desc=f"fold {k + 1} detecting"):
+            dets = classify(clf, gray, ellipse_proposals(gray))
+            per_image.append((boxes, dets))
+            save_vis(img_path, boxes, nms([d for d in dets if d[0] >= VIS_THRESHOLD]))
 
-    evaluate(clf, test)
+    report(per_image)
+    print(f"{N_FOLDS}-fold CV over {len(per_image)} images; "
+          f"metrics saved to {OUT_DIR / 'metrics.txt'}, annotated images in {OUT_DIR}/")
 
 
 if __name__ == "__main__":
