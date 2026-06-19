@@ -4,7 +4,7 @@ from pathlib import Path
 from skimage import io
 from tqdm import tqdm
 
-from classifiers import knn_classifier, svm_classifier, xgboost_classifier
+from classifiers import knn_classifier, logreg_classifier, xgboost_classifier
 from features import correlogram_features, haralick_features, hog_features
 from localizers import (
     hough_ellipse_localizer,
@@ -18,12 +18,12 @@ IMG_DIR = ROOT / "images_ready"
 LABEL_DIR = ROOT / "labels" / "labels"
 
 LOCALIZERS = [
-    sliding_window_localizer,
-    hough_ellipse_localizer,
     segmentation_localizer,
+    hough_ellipse_localizer,
+    sliding_window_localizer,
 ]
 FEATURES = [hog_features, correlogram_features, haralick_features]
-CLASSIFIERS = [svm_classifier, knn_classifier, xgboost_classifier]
+CLASSIFIERS = [logreg_classifier, knn_classifier, xgboost_classifier]
 
 
 def load_dataset():
@@ -57,7 +57,8 @@ def main():
 
     for localizer in tqdm(LOCALIZERS, desc="Localizers"):
         print(f"\n=== {localizer.__name__} ===")
-        result = pipeline.run_and_save(localizer, FEATURES, CLASSIFIERS)
+        result = pipeline.run_and_save(localizer, FEATURES, CLASSIFIERS, threshold="best-f1")
+        print(f"best threshold: {result['threshold']}")
         print({k: round(v, 4) for k, v in result["metrics"].items()})
 
 

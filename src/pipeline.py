@@ -4,16 +4,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 from skimage.transform import resize
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-)
+from sklearn.metrics import f1_score, precision_score, recall_score
 from sklearn.model_selection import GroupKFold
 from tqdm import tqdm
 
 from localizers import label_boxes
+
+THRESHOLDS = tuple(round(float(t), 2) for t in np.arange(0.05, 1.0, 0.05))
 
 
 def _positive_scores(model, X):
@@ -24,8 +21,13 @@ def _positive_scores(model, X):
 
 
 def _metrics(y_true, y_pred):
+    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    denom = tp + fp + fn
     return {
-        "accuracy": accuracy_score(y_true, y_pred),
+        "accuracy": tp / denom if denom else 0.0,
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "f1": f1_score(y_true, y_pred, zero_division=0),
@@ -80,6 +82,8 @@ class DetectionPipeline:
         pos_iou=0.5,
         neg_iou=0.3,
         seed=42,
+        threshold = 0.5,
+        thresholds=THRESHOLDS,
     ):
         X, y, groups, boxes = self.build_dataset(localizer, feature_fns, pos_iou, neg_iou)
         if X.size == 0 or len(np.unique(y)) < 2:
@@ -88,7 +92,7 @@ class DetectionPipeline:
         names = [fn.__name__ for fn in classifier_fns]
         gkf = GroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
-        fold_true, fold_vote, fold_groups, fold_boxes = [], [], [], []
+        fold_true, fold_score, fold_groups, fold_boxes = [], [], [], []
         per_clf = {name: [] for name in names}
         for train_idx, test_idx in gkf.split(X, y, groups):
             X_tr, X_te = X[train_idx], X[test_idx]
@@ -99,23 +103,32 @@ class DetectionPipeline:
                 score = _positive_scores(model, X_te)
                 scores.append(score)
                 per_clf[name].append((score >= 0.5).astype(int))
-            vote = (np.mean(scores, axis=0) >= 0.5).astype(int)
             fold_true.append(y_te)
-            fold_vote.append(vote)
+            fold_score.append(np.mean(scores, axis=0))
             fold_groups.append(groups[test_idx])
             fold_boxes.append(boxes[test_idx])
 
         y_true = np.concatenate(fold_true)
-        y_vote = np.concatenate(fold_vote)
+        y_score = np.concatenate(fold_score)
+        sweep = {
+            round(float(t), 4): _metrics(y_true, (y_score >= t).astype(int))
+            for t in thresholds
+        }
+        if threshold == "best-f1":
+            threshold = max(sweep, key=lambda t: sweep[t]["f1"])
+        y_vote = (y_score >= threshold).astype(int)
         classifier_metrics = {
             name: _metrics(y_true, np.concatenate(folds))
             for name, folds in per_clf.items()
         }
         return {
             "metrics": _metrics(y_true, y_vote),
+            "threshold": threshold,
+            "sweep": sweep,
             "classifier_metrics": classifier_metrics,
             "y_true": y_true,
             "y_pred": y_vote,
+            "y_score": y_score,
             "groups": np.concatenate(fold_groups),
             "boxes": np.concatenate(fold_boxes),
             "n_samples": int(len(y)),
@@ -131,13 +144,16 @@ class DetectionPipeline:
         pos_iou=0.5,
         neg_iou=0.3,
         seed=42,
+        threshold=0.5,
+        thresholds=THRESHOLDS,
     ):
         result = self.run(
-            localizer, feature_fns, classifier_fns, n_splits, pos_iou, neg_iou, seed
+            localizer, feature_fns, classifier_fns, n_splits, pos_iou, neg_iou,
+            seed, threshold, thresholds,
         )
         feats = "-".join(fn.__name__ for fn in feature_fns)
         clfs = "-".join(fn.__name__ for fn in classifier_fns)
-        out_dir = Path(f"{localizer.__name__}_{feats}_{clfs}_detections")
+        out_dir = Path("results") / f"{localizer.__name__}_{feats}_{clfs}_detections"
         out_dir.mkdir(parents=True, exist_ok=True)
         self._save_metrics(out_dir, result)
         self._save_detections(out_dir, result)
@@ -145,14 +161,21 @@ class DetectionPipeline:
 
     def _save_metrics(self, out_dir, result):
         lines = [f"samples: {result['n_samples']}  positives: {result['n_positive']}",
-                 "ensemble (soft vote):"]
+                 f"ensemble (soft vote @ threshold {result['threshold']}):"]
         lines += [f"  {k}: {v:.4f}" for k, v in result["metrics"].items()]
-        lines.append("per classifier:")
+        lines.append("threshold sweep (ensemble):")
+        lines.append(f"  {'thresh':>6}  {'acc':>6}  {'prec':>6}  {'recall':>6}  {'f1':>6}")
+        for t, m in result["sweep"].items():
+            lines.append(f"  {t:>6.2f}  {m['accuracy']:>6.4f}  {m['precision']:>6.4f}  "
+                         f"{m['recall']:>6.4f}  {m['f1']:>6.4f}")
+        lines.append("per classifier (@ 0.5):")
         for name, m in result["classifier_metrics"].items():
             lines.append(f"  {name}: " + "  ".join(f"{k}={v:.4f}" for k, v in m.items()))
         (out_dir / "metrics.txt").write_text("\n".join(lines) + "\n")
         (out_dir / "metrics.json").write_text(json.dumps({
+            "threshold": result["threshold"],
             "metrics": result["metrics"],
+            "sweep": result["sweep"],
             "classifier_metrics": result["classifier_metrics"],
             "n_samples": result["n_samples"],
             "n_positive": result["n_positive"],

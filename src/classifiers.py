@@ -1,5 +1,6 @@
 import numpy as np
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -38,6 +39,23 @@ def svm_classifier(
     clf = make_pipeline(
         StandardScaler(),
         CalibratedClassifierCV(svc, cv=cv),
+    )
+    clf.fit(np.asarray(X_train), np.asarray(y_train))
+    return clf, evaluate(clf, X_test, y_test)
+
+
+def logreg_classifier(
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    C=1.0,
+    max_iter=1000,
+    class_weight="balanced",
+):
+    clf = make_pipeline(
+        StandardScaler(),
+        LogisticRegression(C=C, max_iter=max_iter, class_weight=class_weight),
     )
     clf.fit(np.asarray(X_train), np.asarray(y_train))
     return clf, evaluate(clf, X_test, y_test)
